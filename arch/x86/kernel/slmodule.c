@@ -7,6 +7,8 @@
  * Copyright (c) 2025, Oracle and/or its affiliates.
  */
 
+#define DEBUG
+
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/fs.h>
@@ -14,6 +16,7 @@
 #include <linux/linkage.h>
 #include <linux/mm.h>
 #include <linux/io.h>
+#include <linux/printk.h>
 #include <linux/uaccess.h>
 #include <linux/security.h>
 #include <linux/memblock.h>
@@ -260,6 +263,7 @@ static void slaunch_intel_evtlog(void __iomem *txt)
 		slaunch_reset(txt, "Error failed to memremap TXT heap\n", SL_ERROR_HEAP_MAP);
 
 	params = (struct txt_os_mle_data *)txt_os_mle_data_start(txt_heap);
+	print_hex_dump_bytes("scratch: ", DUMP_PREFIX_OFFSET, params->mle_scratch, 64);
 
 	/* Get the SLRT and remap it */
 	slrt = memremap(params->slrt, sizeof(*slrt), MEMREMAP_WB);

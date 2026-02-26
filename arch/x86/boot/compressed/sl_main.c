@@ -35,6 +35,12 @@ static u32 tpm_num_algs;
 static struct tcg_efi_specid_event_algs *tpm_algs;
 static u8 event_buf[PAGE_SIZE];
 
+static u8 sl_dbg_extends[16];
+static u8 sl_dbg_pcrs[16];
+static u8 sl_dbg_extends_count;
+static u8 sl_dbg_err_pcr;
+static u8 sl_dbg_err_digest_count;
+
 /* Simple instance of a TPM chip object */
 static struct tpm_chip chip;
 
@@ -378,6 +384,15 @@ static void sl_tpm2_extend(u32 pcr, u32 event_type,
 	 * event header.
 	 */
 	rc = tpm2_pcr_extend(&chip, pcr, (struct tpm_digest *)(event_buf + sizeof(*head)), head->count);
+
+	sl_dbg_extends[sl_dbg_extends_count] = -rc;
+	sl_dbg_pcrs[sl_dbg_extends_count] = pcr;
+	if (rc) {
+		sl_dbg_err_pcr = pcr;
+		sl_dbg_err_digest_count = head->count;
+	}
+	sl_dbg_extends_count++;
+
 	if (rc)
 		sl_txt_reset(SL_ERROR_TPM_EXTEND);
 
@@ -553,6 +568,17 @@ asmlinkage __visible void sl_check_region(void *base, u32 size)
 	sl_check_pmr_coverage(base, size, false);
 }
 
+static void sl_dbg_fill_scratch(u8 *scratch, u32 size)
+{
+	memcpy(scratch+16, sl_dbg_extends, sl_dbg_extends_count);
+	scratch[16 + sl_dbg_extends_count] = 0x42;
+	memcpy(scratch+24, sl_dbg_pcrs, sl_dbg_extends_count);
+	scratch[24 + sl_dbg_extends_count] = 0x42;
+	scratch[32] = sl_dbg_err_pcr;
+	scratch[33] = sl_dbg_err_digest_count;
+	scratch[34] = 0x42;
+}
+
 asmlinkage __visible void sl_main(void *bootparams)
 {
 	struct boot_params *bp = (struct boot_params *)bootparams;
@@ -626,6 +652,7 @@ asmlinkage __visible void sl_main(void *bootparams)
 	/* No PMR check is needed, the TXT heap is covered by the DPR */
 	txt_heap = (void *)sl_txt_read(TXT_CR_HEAP_BASE);
 	os_mle_data = txt_os_mle_data_start(txt_heap);
+	sl_dbg_fill_scratch(os_mle_data->mle_scratch, sizeof(os_mle_data->mle_scratch));
 
 	/*
 	 * Now that the OS-MLE data is measured, ensure the MTRR and
