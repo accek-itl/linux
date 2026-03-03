@@ -53,6 +53,10 @@
 
 #include "tpm.h"
 
+/* Interface-specific ops initializers (internal) */
+void tpm_tis_init_ops(struct tpm_ops *ops);
+void tpm_crb_init_ops(struct tpm_ops *ops);
+
 static u8 tpm_buf_page[PAGE_SIZE];
 
 /*
@@ -94,389 +98,6 @@ static u32 tpm_get_alg_size(u16 alg_id)
 	};
 }
 
-static inline u8 tpm_read8(struct tpm_chip *chip, u32 field)
-{
-	void *mmio_addr = (void *)(uintptr_t)(chip->baseaddr | field);
-	return readb(mmio_addr);
-}
-
-static inline void tpm_write8(struct tpm_chip *chip, u32 field, u8 val)
-{
-	void *mmio_addr = (void *)(uintptr_t)(chip->baseaddr | field);
-	writeb(val, mmio_addr);
-}
-
-static inline u32 tpm_read32(struct tpm_chip *chip, u32 field)
-{
-	void *mmio_addr = (void *)(uintptr_t)(chip->baseaddr | field);
-	return readl(mmio_addr);
-}
-
-static inline void tpm_write32(struct tpm_chip *chip, u32 field, u32 val)
-{
-	void *mmio_addr = (void *)(uintptr_t)(chip->baseaddr | field);
-	writel(val, mmio_addr);
-}
-
-static unsigned long ticks_per_ms = (5UL * 1000 * 1000 /* cpu_khz */);
-
-static inline ktime_t tpm_now_ms(void)
-{
-	return rdtsc()/ticks_per_ms;
-}
-
-/*
- * We're far too early to calibrate time.  Assume a 5GHz processor (the upper
- * end of the Fam19h range), which causes us to be wrong in the safe direction
- * on slower systems.
- */
-static inline void tpm_mdelay(unsigned int msecs)
-{
-	unsigned long ticks = msecs * ticks_per_ms;
-	unsigned long s, e;
-
-	s = rdtsc();
-	do {
-		cpu_relax();
-		e = rdtsc();
-	} while ((e - s) < ticks);
-}
-
-static inline u8 __tis_status(struct tpm_chip *chip)
-{
-	return tpm_read8(chip, TPM_STS(chip->locality));
-}
-
-static inline void __tis_cancel(struct tpm_chip *chip)
-{
-	/* This causes the current command to be aborted */
-	tpm_write8(chip, TPM_STS(chip->locality), TPM_STS_COMMAND_READY);
-}
-
-static int __tis_get_burstcount(struct tpm_chip *chip)
-{
-	ktime_t stop;
-	int burstcnt;
-
-	stop = tpm_now_ms() + chip->timeout_d;
-	do {
-		burstcnt = tpm_read8(chip, (TPM_STS(chip->locality) + 1));
-		burstcnt += tpm_read8(chip, TPM_STS(chip->locality) + 2) << 8;
-
-		if (burstcnt)
-			return burstcnt;
-
-		tpm_mdelay(TPM_TIMEOUT);
-	} while (tpm_now_ms() < stop);
-
-	return -EBUSY;
-}
-
-static int __tis_wait_for_stat(struct tpm_chip *chip, u8 mask, ktime_t timeout)
-{
-	ktime_t stop;
-	u8 status;
-
-	if ((__tis_status(chip) & mask) == mask)
-		return 0;
-
-	stop = tpm_now_ms() + timeout;
-	do {
-		tpm_mdelay(TPM_TIMEOUT);
-
-		status = __tis_status(chip);
-		if ((status & mask) == mask)
-			return 0;
-	} while (tpm_now_ms() < stop);
-
-	return -ETIME;
-}
-
-static int __tis_recv_data(struct tpm_chip *chip, u8 *buf, int count)
-{
-	int size = 0;
-	int burstcnt;
-
-	while (size < count && __tis_wait_for_stat(chip, TPM_STS_DATA_AVAIL | TPM_STS_VALID, chip->timeout_c) == 0) {
-		burstcnt = __tis_get_burstcount(chip);
-
-		for ( ; burstcnt > 0 && size < count; --burstcnt)
-			buf[size++] = tpm_read8(chip, TPM_DATA_FIFO(chip->locality));
-	}
-
-	return size;
-}
-
-/**
- * tpm_tis_check_locality - Check if the given locality is the active one
- * @chip:	The TPM chip instance
- * @loc:	The locality to check
- *
- * Return: true - locality active, false - not active
- */
-bool tpm_tis_check_locality(struct tpm_chip *chip, int loc)
-{
-	if ((tpm_read8(chip, TPM_ACCESS(loc)) & (TPM_ACCESS_ACTIVE_LOCALITY | TPM_ACCESS_VALID)) == (TPM_ACCESS_ACTIVE_LOCALITY | TPM_ACCESS_VALID)) {
-		chip->locality = loc;
-		return true;
-	}
-
-	return false;
-}
-
-/**
- * tpm_tis_release_locality - Release the active locality
- * @chip:	The TPM chip instance
- */
-void tpm_tis_release_locality(struct tpm_chip *chip)
-{
-	if ((tpm_read8(chip, TPM_ACCESS(chip->locality)) & (TPM_ACCESS_REQUEST_PENDING | TPM_ACCESS_VALID)) == (TPM_ACCESS_REQUEST_PENDING | TPM_ACCESS_VALID))
-		tpm_write8(chip, TPM_ACCESS(chip->locality), TPM_ACCESS_RELINQUISH_LOCALITY);
-
-	chip->locality = 0;
-}
-
-/**
- * tpm_tis_request_locality - Request to make the given locality the active one
- * @chip:	The TPM chip instance
- * @loc:	The locality to make active/set as current
- *
- * Return:
- *  >= 0 - Success, new active locality returned or locality already active
- *  < 0  - Error occurred
- */
-int tpm_tis_request_locality(struct tpm_chip *chip, int loc)
-{
-	ktime_t stop;
-
-	if (tpm_tis_check_locality(chip, loc))
-		return loc;
-
-	/* Set the new locality */
-	tpm_write8(chip, TPM_ACCESS(loc), TPM_ACCESS_REQUEST_USE);
-
-	stop = tpm_now_ms() + chip->timeout_b;
-	do {
-		if (tpm_tis_check_locality(chip, loc))
-			return loc;
-
-		tpm_mdelay(TPM_TIMEOUT);
-	} while (tpm_now_ms() < stop);
-
-	return -1;
-}
-
-/**
- * tpm_tis_disable_interrupts - Disable interrupts for the TPM, use polling mode only
- * @chip:	The TPM chip instance
- */
-void tpm_tis_disable_interrupts(struct tpm_chip *chip)
-{
-	u32 intmask;
-
-	intmask = tpm_read32(chip, TPM_INT_ENABLE(chip->locality));
-	/* Disable everything to make sure it is in a consistent state */
-	intmask &= ~(TPM_GLOBAL_INT_ENABLE | TPM_INTF_CMD_READY_INT | TPM_INTF_LOCALITY_CHANGE_INT | TPM_INTF_STS_VALID_INT | TPM_INTF_DATA_AVAIL_INT);
-	tpm_write32(chip, TPM_INT_ENABLE(chip->locality), intmask);
-}
-
-/**
- * tpm_tis_recv - Receive response data from TPM via TIS FIFO
- * @chip:	The TPM chip instance
- * @buf:	The response buffer
- * @count:	Length of the response buffer
- *
- * Return:
- *  = 0 - Success, no response data
- *  > 0 - Success, value is the response data length
- *  < 0 - Error occurred
- */
-static int tpm_tis_recv(struct tpm_chip *chip, u8 *buf, int count)
-{
-	int expected, status, size = 0, rc = -EIO;
-
-	if (count < TPM_HEADER_SIZE)
-		goto out;
-
-	/* Read first 10 bytes, including tag, paramsize, and result */
-	size = __tis_recv_data(chip, buf, TPM_HEADER_SIZE);
-	if (size < TPM_HEADER_SIZE)
-		goto out;
-
-	expected = be32_to_cpu(*((u32 *)(buf + 2)));
-	if (expected > count)
-		goto out;
-
-	size += __tis_recv_data(chip, &buf[TPM_HEADER_SIZE], expected - TPM_HEADER_SIZE);
-	if (size < expected) {
-		rc = -ETIME;
-		goto out;
-	}
-
-	__tis_wait_for_stat(chip, TPM_STS_VALID, chip->timeout_c);
-
-	status = __tis_status(chip);
-	if (status & TPM_STS_DATA_AVAIL) {
-		rc = -EIO;
-		goto out;
-	}
-
-	__tis_cancel(chip);
-	return size;
-out:
-	__tis_cancel(chip);
-	tpm_tis_release_locality(chip);
-	return rc;
-}
-
-/**
- * tpm_tis_send - Send command to TPM via TIS FIFO
- * @chip:	The TPM chip instance
- * @buf:	The command buffer
- * @len:	Length of the command buffer to send
- *
- * Return:
- *  = len - Success, all data sent
- *  < 0	  - Error occurred
- */
-static int tpm_tis_send(struct tpm_chip *chip, u8 *buf, int len)
-{
-	int status, burstcnt = 0;
-	int count = 0;
-	int rc = 0;
-
-	status = __tis_status(chip);
-	if ((status & TPM_STS_COMMAND_READY) == 0) {
-		__tis_cancel(chip);
-		if (__tis_wait_for_stat(chip, TPM_STS_COMMAND_READY, chip->timeout_b) < 0) {
-			rc = -ETIME;
-			goto out_err;
-		}
-	}
-
-	while (count < len - 1) {
-		burstcnt = __tis_get_burstcount(chip);
-		for ( ; burstcnt > 0 && count < len - 1; --burstcnt)
-			tpm_write8(chip, TPM_DATA_FIFO(chip->locality), buf[count++]);
-
-		__tis_wait_for_stat(chip, TPM_STS_VALID, chip->timeout_c);
-		status = __tis_status(chip);
-		if ((status & TPM_STS_DATA_EXPECT) == 0) {
-			rc = -EIO;
-			goto out_err;
-		}
-	}
-
-	/* Write last byte */
-	tpm_write8(chip, TPM_DATA_FIFO(chip->locality), buf[count]);
-	__tis_wait_for_stat(chip, TPM_STS_VALID, chip->timeout_c);
-	status = __tis_status(chip);
-	if ((status & TPM_STS_DATA_EXPECT) != 0) {
-		rc = -EIO;
-		goto out_err;
-	}
-
-	/* Go and do it */
-	tpm_write8(chip, TPM_STS(chip->locality), TPM_STS_GO);
-
-	return len;
-
-out_err:
-	__tis_cancel(chip);
-	tpm_tis_release_locality(chip);
-	return rc;
-}
-
-/**
- * tpm_tis_transmit - Transmit a TPM FIFO command
- * @chip:	The TPM chip instance
- * @buf:	The request and response buffer object
- * @bufsize:	Entire size available in buffer
- *
- * Return:
- *  = 0 - Success, no returned data
- *  > 0 - Success, value is the return data length
- *  < 0 - Error occurred
- */
-static int tpm_tis_transmit(struct tpm_chip *chip, u8 *buf, u32 bufsize)
-{
-	ktime_t stop;
-	u32 count;
-	u8 status;
-	int rc;
-
-	count = be32_to_cpu(*((u32 *) (buf + 2)));
-	if (count == 0)
-		return -ENODATA;
-
-	if (count > bufsize)
-		return -E2BIG;
-
-	rc = tpm_tis_send(chip, buf, count);
-	if (rc < 0)
-		goto out;
-
-	stop = tpm_now_ms() + TIS_DURATION;
-	do {
-		status = __tis_status(chip);
-		if ((status & (TPM_STS_DATA_AVAIL | TPM_STS_VALID)) == (TPM_STS_DATA_AVAIL | TPM_STS_VALID))
-			goto out_recv;
-
-		if (status == TPM_STS_COMMAND_READY) {
-			rc = -ECANCELED;
-			goto out;
-		}
-
-		tpm_mdelay(TPM_TIMEOUT);
-		rmb();
-	} while (tpm_now_ms() < stop);
-
-	/* Cancel the command */
-	__tis_cancel(chip);
-	rc = -ETIME;
-	goto out;
-
-out_recv:
-	rc = tpm_tis_recv(chip, buf, bufsize);
-	if (rc >= 0) {
-		if (rc > 0 && rc < TPM_HEADER_SIZE)
-			return -EFAULT;
-		return rc;
-	}
-	/* Else return was an error, nothing to receive */
-
-out:
-	return rc;
-}
-
-/**
- * tpm_find_interface_and_family - interface FIFO/CRB, family 2.0 or 1.2
- * @chip:	The TPM chip instance
- *
- * Return: TPM family ID enum
- */
-static enum tpm_family tpm_find_interface_and_family(struct tpm_chip *chip)
-{
-	struct tpm_intf_capability intf_cap;
-	struct tpm_interface_id intf_id;
-
-	/* First determine if the interface is CRB. It it is, then for sure we have 2.0 family. */
-	intf_id.val = tpm_read32(chip, TPM_INTF_ID(0));
-	if (intf_id.interface_type == TPM_CRB_INTF_ACTIVE)
-		return TPM_FAMILY_INVALID; /* We don't support CRB interface yet */
-	if (intf_id.interface_type != TPM_TIS_INTF_ACTIVE)
-		return TPM_FAMILY_INVALID; /* Unsupported interface type */
-
-	/* Sort out whether it is 1.x */
-	intf_cap.val = tpm_read32(chip, TPM_INTF_CAPS(0));
-	if ((intf_cap.interface_version == TPM_TIS_INTF_12) ||
-	    (intf_cap.interface_version == TPM_TIS_INTF_13))
-		return TPM_FAMILY_12; /* Always TIS */
-
-	/* Else TPM 2.0 with TIS interface */
-	return TPM_FAMILY_20;
-}
-
 /**
  * tpm1_pcr_extend - send a TPM1 extend command to the device
  * @chip:	a TPM chip to use
@@ -502,7 +123,7 @@ int tpm1_pcr_extend(struct tpm_chip *chip, u32 pcr_idx, const u8 *hash)
 	tpm_buf_append_u32(buf, pcr_idx);
 	tpm_buf_append(buf, hash, TPM_DIGEST_SIZE);
 
-	rc = tpm_tis_transmit(chip, buf->data, PAGE_SIZE);
+	rc = chip->ops.transmit(chip, buf->data, PAGE_SIZE);
 
 	/* Ignoring output */
 	if (rc > 0)
@@ -559,7 +180,7 @@ int tpm2_pcr_extend(struct tpm_chip *chip, u32 pcr_idx,
 			       tpm_get_alg_size(digests[i].alg_id));
 	}
 
-	rc = tpm_tis_transmit(chip, buf->data, PAGE_SIZE);
+	rc = chip->ops.transmit(chip, buf->data, PAGE_SIZE);
 
 	/* Ignoring output */
 	if (rc > 0)
@@ -570,16 +191,35 @@ int tpm2_pcr_extend(struct tpm_chip *chip, u32 pcr_idx,
 	return rc;
 }
 
+int tpm_request_locality(struct tpm_chip *chip, int loc)
+{
+	return chip->ops.request_locality(chip, loc);
+}
+
+void tpm_disable_interrupts(struct tpm_chip *chip)
+{
+	chip->ops.disable_interrupts(chip);
+}
+
+/**
+ * early_tpm_init - Detect TPM interface type and family, initialize the chip
+ * @chip:	The TPM chip instance to initialize
+ * @baseaddr:	MMIO base address for the TPM
+ *
+ * Detects whether the TPM uses TIS (FIFO) or CRB interface via the
+ * TPM_INTF_ID register, determines the TPM family (1.2 or 2.0), sets
+ * up function pointers for the detected interface, and performs
+ * interface-specific initialization.
+ *
+ * Return: TPM_SUCCESS (0) on success, TPM_ERR_INVALID_FAMILY on failure
+ */
 int early_tpm_init(struct tpm_chip *chip, u64 baseaddr)
 {
-	u32 didvid;
+	struct tpm_interface_id intf_id;
+	struct tpm_intf_capability intf_cap;
 
 	memset(chip, 0, sizeof(*chip));
 	chip->baseaddr = baseaddr;
-
-	chip->family = tpm_find_interface_and_family(chip);
-	if (chip->family == TPM_FAMILY_INVALID)
-		return TPM_ERR_INVALID_FAMILY;
 
 	/* Set default timeouts */
 	chip->timeout_a = TIS_SHORT_TIMEOUT;
@@ -587,17 +227,33 @@ int early_tpm_init(struct tpm_chip *chip, u64 baseaddr)
 	chip->timeout_c = TIS_SHORT_TIMEOUT;
 	chip->timeout_d = TIS_SHORT_TIMEOUT;
 
-	/* Get the vendor and device ids */
-	didvid = tpm_read32(chip, TPM_DID_VID(0));
-	chip->did = didvid >> 16;
-	chip->vid = didvid & 0xFFFF;
+	/* Detect interface type from TPM_INTF_ID register */
+	intf_id.val = tpm_read32(chip, TPM_INTF_ID(0));
+
+	if (intf_id.interface_type == TPM_CRB_INTF_ACTIVE) {
+		/* CRB interface — always TPM 2.0 */
+		chip->family = TPM_FAMILY_20;
+		tpm_crb_init_ops(&chip->ops);
+	} else if (intf_id.interface_type == TPM_TIS_INTF_ACTIVE) {
+		/* TIS interface — determine family from interface capability */
+		intf_cap.val = tpm_read32(chip, TPM_INTF_CAPS(0));
+		if ((intf_cap.interface_version == TPM_TIS_INTF_12) ||
+		    (intf_cap.interface_version == TPM_TIS_INTF_13))
+			chip->family = TPM_FAMILY_12;
+		else
+			chip->family = TPM_FAMILY_20;
+		tpm_tis_init_ops(&chip->ops);
+	} else {
+		/* Unsupported interface type */
+		return TPM_ERR_INVALID_FAMILY;
+	}
 
 	return TPM_SUCCESS;
 }
 
 int early_tpm_fini(struct tpm_chip *chip)
 {
-	tpm_tis_release_locality(chip);
+	chip->ops.release_locality(chip);
 	memset(chip, 0, sizeof(*chip));
 
 	return TPM_SUCCESS;

@@ -877,7 +877,7 @@ static int crb_acpi_add(struct acpi_device *device)
 
 	dev_set_drvdata(&chip->dev, priv);
 	chip->acpi_dev_handle = device->handle;
-	chip->flags = TPM_CHIP_FLAG_TPM2;
+	chip->flags = TPM_CHIP_FLAG_TPM2 | TPM_CHIP_FLAG_SET_LOCALITY_ENABLED;
 
 	rc = tpm_chip_bootstrap(chip);
 	if (rc)

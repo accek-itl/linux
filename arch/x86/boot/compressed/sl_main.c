@@ -625,13 +625,13 @@ asmlinkage __visible void sl_main(void *bootparams)
 	 * rather polling for command completion (there is no infrastructure
 	 * setup for servicing interrupts in the setup kernel).
 	 */
-	if (early_tpm_init(&chip, TIS_MEM_X86_LPC_BASE))
+	if (early_tpm_init(&chip, TPM_MEM_X86_LPC_BASE))
 		sl_txt_reset(SL_ERROR_TPM_INIT);
-	if (tpm_tis_request_locality(&chip, TPM_LOCALITY_2) < 0)
+	if (tpm_request_locality(&chip, TPM_LOCALITY_2) < 0)
 		sl_txt_reset(SL_ERROR_TPM_INIT);
 	if (chip.family == TPM_FAMILY_20 && tpm_log_ver != SL_TPM2_LOG)
 		sl_txt_reset(SL_ERROR_TPM_INIT);
-	tpm_tis_disable_interrupts(&chip);
+	tpm_disable_interrupts(&chip);
 
 	/*
 	 * Sanitize them before measuring. Set the SLAUNCH_FLAG early since if
