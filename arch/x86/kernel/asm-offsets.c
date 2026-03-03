@@ -140,6 +140,14 @@ static void __used common(void)
 	OFFSET(SL_mle_size, txt_os_sinit_data, mle_size);
 	OFFSET(SL_vtd_pmr_lo_base, txt_os_sinit_data, vtd_pmr_lo_base);
 	OFFSET(SL_vtd_pmr_lo_size, txt_os_sinit_data, vtd_pmr_lo_size);
+	DEFINE(SL_os_sinit_ext_data, sizeof(struct txt_os_sinit_data));
+	OFFSET(SL_ext_data_type, txt_heap_ext_data_element, type);
+	OFFSET(SL_ext_data_size, txt_heap_ext_data_element, size);
+	DEFINE(SL_ext_data_header_size, sizeof(struct txt_heap_ext_data_element));
+	OFFSET(SL_tpr_cnt, txt_heap_tpr_req_element, tpr_cnt);
+	OFFSET(SL_tpr_range_base, txt_heap_tpr_range, tpr_range_base);
+	OFFSET(SL_tpr_range_size, txt_heap_tpr_range, tpr_range_size);
+	DEFINE(SL_tpr_req_arr, sizeof(struct txt_heap_tpr_req_element));
 	OFFSET(SL_rlp_wakeup_addr, txt_sinit_mle_data, rlp_wakeup_addr);
 	OFFSET(SL_rlp_gdt_base, smx_rlp_mle_join, rlp_gdt_base);
 	OFFSET(SL_rlp_entry_point, smx_rlp_mle_join, rlp_entry_point);

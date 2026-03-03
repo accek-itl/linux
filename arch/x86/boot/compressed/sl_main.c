@@ -113,12 +113,16 @@ static struct slr_table *sl_locate_and_validate_slrt(void)
 
 /*
  * This is a validation routine that allows checking if a block of memory
- * is protected from external access by being in a PMR range. If allow_hi is set,
- * ranges above 4GB are allowed.
+ * is protected from DMA by being within a protected range. The protection
+ * may come from either TPR (TXT Protected Range) on newer platforms or
+ * legacy PMR (Protected Memory Regions). If allow_hi is set, ranges above
+ * 4GB are allowed.
  */
-static void sl_check_pmr_coverage(void *base, u32 size, bool allow_hi)
+static void sl_check_dma_protection(void *base, u32 size, bool allow_hi)
 {
+	struct txt_heap_tpr_req_element *tpr_req;
 	struct txt_os_sinit_data *os_sinit_data;
+	u64 lo_size, hi_base, hi_size;
 	void *end = base + size;
 	void *txt_heap;
 
@@ -128,26 +132,57 @@ static void sl_check_pmr_coverage(void *base, u32 size, bool allow_hi)
 	txt_heap = (void *)sl_txt_read(TXT_CR_HEAP_BASE);
 	os_sinit_data = txt_os_sinit_data_start(txt_heap);
 
+	if (os_sinit_data->capabilities & (1 << TXT_SINIT_MLE_CAP_TPR_SUPPORT)) {
+		tpr_req = txt_find_tpr_req_element(os_sinit_data);
+		if (!tpr_req)
+			sl_txt_reset(SL_ERROR_TPR_NOT_FOUND);
+		if (tpr_req->tpr_cnt < 1)
+			sl_txt_reset(SL_ERROR_TPR_INVALID);
+		if (tpr_req->tpr_cnt > 2)
+			sl_txt_reset(SL_ERROR_TPR_UNSUPPORTED);
+
+		lo_size = tpr_req->tpr_req_arr[0].tpr_range_size;
+		if (lo_size > SZ_4G)
+			sl_txt_reset(SL_ERROR_TPR_INVALID);
+
+		if (tpr_req->tpr_cnt >= 2) {
+			hi_base = tpr_req->tpr_req_arr[1].tpr_range_base;
+			hi_size = tpr_req->tpr_req_arr[1].tpr_range_size;
+
+			if (hi_base < SZ_4G)
+				sl_txt_reset(SL_ERROR_TPR_UNSUPPORTED);
+			if (lo_size > hi_base)
+				sl_txt_reset(SL_ERROR_TPR_INVALID);
+		} else {
+			/* <= 4GB RAM: no hi range */
+			hi_base = 0;
+			hi_size = 0;
+		}
+	} else {
+		lo_size = os_sinit_data->vtd_pmr_lo_size;
+		hi_base = os_sinit_data->vtd_pmr_hi_base;
+		hi_size = os_sinit_data->vtd_pmr_hi_size;
+	}
+
 	if ((u64)end >= SZ_4G && (u64)base < SZ_4G)
 		sl_txt_reset(SL_ERROR_REGION_STRADDLE_4GB);
 
 	/*
-	 * Note that the late stub code validates that the hi PMR covers
+	 * Note that the late stub code validates that the hi range covers
 	 * all memory above 4G. At this point the code can only check that
-	 * regions are within the hi PMR but that is sufficient.
+	 * regions are within the hi range but that is sufficient.
 	 */
 	if ((u64)end > SZ_4G && (u64)base >= SZ_4G) {
 		if (allow_hi) {
-			if (end >= (void *)(os_sinit_data->vtd_pmr_hi_base +
-					    os_sinit_data->vtd_pmr_hi_size))
-				sl_txt_reset(SL_ERROR_BUFFER_BEYOND_PMR);
+			if (end >= (void *)(hi_base + hi_size))
+				sl_txt_reset(SL_ERROR_BUFFER_BEYOND_DMA_PROT);
 		} else {
 			sl_txt_reset(SL_ERROR_REGION_ABOVE_4GB);
 		}
 	}
 
-	if (end >= (void *)os_sinit_data->vtd_pmr_lo_size)
-		sl_txt_reset(SL_ERROR_BUFFER_BEYOND_PMR);
+	if (end >= (void *)lo_size)
+		sl_txt_reset(SL_ERROR_BUFFER_BEYOND_DMA_PROT);
 }
 
 /*
@@ -251,22 +286,22 @@ static void sl_validate_event_log_buffer(void)
 	 * the MLE image.
 	 */
 	if (evtlog_base >= mle_end && evtlog_end > mle_end)
-		goto pmr_check; /* above */
+		goto dma_prot_check; /* above */
 
 	if (evtlog_end <= mle_base && evtlog_base < mle_base)
-		goto pmr_check; /* below */
+		goto dma_prot_check; /* below */
 
 	sl_txt_reset(SL_ERROR_MLE_BUFFER_OVERLAP);
 
-pmr_check:
+dma_prot_check:
 	/*
 	 * The TXT heap is protected by the DPR. If the TPM event log is
-	 * inside the TXT heap, there is no need for a PMR check.
+	 * inside the TXT heap, there is no need for a DMA protection check.
 	 */
 	if (evtlog_base > txt_heap && evtlog_end < txt_end)
 		return;
 
-	sl_check_pmr_coverage(evtlog_base, evtlog_size, true);
+	sl_check_dma_protection(evtlog_base, evtlog_size, true);
 }
 
 static void sl_find_event_log_algorithms(void)
@@ -423,7 +458,7 @@ static struct setup_data *sl_handle_setup_data(struct setup_data *curr,
 	if (curr->type == SETUP_INDIRECT) {
 		ind = (struct setup_indirect *)((u8 *)curr + offsetof(struct setup_data, data));
 
-		sl_check_pmr_coverage((void *)ind->addr, ind->len, true);
+		sl_check_dma_protection((void *)ind->addr, ind->len, true);
 
 		sl_tpm_extend(entry->pcr, SL_EVTYPE_SECURE_LAUNCH, (void *)ind->addr, ind->len,
 			      entry->evt_info);
@@ -431,7 +466,7 @@ static struct setup_data *sl_handle_setup_data(struct setup_data *curr,
 		return next;
 	}
 
-	sl_check_pmr_coverage(((u8 *)curr) + sizeof(*curr),
+	sl_check_dma_protection(((u8 *)curr) + sizeof(*curr),
 			      curr->len, true);
 
 	sl_tpm_extend(entry->pcr, SL_EVTYPE_SECURE_LAUNCH, ((u8 *)curr) + sizeof(*curr), curr->len,
@@ -565,7 +600,7 @@ static void sl_process_extend_uefi_config(struct slr_table *slrt)
 
 asmlinkage __visible void sl_check_region(void *base, u32 size)
 {
-	sl_check_pmr_coverage(base, size, false);
+	sl_check_dma_protection(base, size, false);
 }
 
 static void sl_dbg_fill_scratch(u8 *scratch, u32 size)
@@ -640,7 +675,7 @@ asmlinkage __visible void sl_main(void *bootparams)
 	sanitize_boot_params(bp);
 	bp->hdr.loadflags |= SLAUNCH_FLAG;
 
-	sl_check_pmr_coverage(bootparams, PAGE_SIZE, false);
+	sl_check_dma_protection(bootparams, PAGE_SIZE, false);
 
 	/*
 	 * Extend measurements into the TPM for entities specified in the
@@ -649,7 +684,7 @@ asmlinkage __visible void sl_main(void *bootparams)
 	sl_process_extend_policy(slrt);
 	sl_process_extend_uefi_config(slrt);
 
-	/* No PMR check is needed, the TXT heap is covered by the DPR */
+	/* No DMA protection check is needed, the TXT heap is covered by the DPR */
 	txt_heap = (void *)sl_txt_read(TXT_CR_HEAP_BASE);
 	os_mle_data = txt_os_mle_data_start(txt_heap);
 	sl_dbg_fill_scratch(os_mle_data->mle_scratch, sizeof(os_mle_data->mle_scratch));

@@ -74,6 +74,7 @@
  */
 #define TXT_SINIT_MLE_CAP_RLP_WAKE_GETSEC	0
 #define TXT_SINIT_MLE_CAP_RLP_WAKE_MONITOR	1
+#define TXT_SINIT_MLE_CAP_TPR_SUPPORT		14
 
 /*
  * OS/MLE Secure Launch Specific Definitions
@@ -90,6 +91,14 @@
 #define TXT_SINIT_MLE_DATA_TABLE	4
 #define TXT_SINIT_TABLE_MAX		TXT_SINIT_MLE_DATA_TABLE
 
+/*
+ * TXT Heap Extended Data Element Types
+ */
+#define TXT_HEAP_EXTDATA_TYPE_END			0
+#define TXT_HEAP_EXTDATA_TYPE_TPM_EVENT_LOG_PTR		5
+#define TXT_HEAP_EXTDATA_TYPE_EVENT_LOG_POINTER2_1	8
+#define TXT_HEAP_EXTDATA_TYPE_TPR_REQ			13
+
 #ifndef __ASSEMBLER__
 
 /*
@@ -101,26 +110,30 @@ struct txt_heap_ext_data_element {
 	/* Data */
 } __packed;
 
-#define TXT_HEAP_EXTDATA_TYPE_END			0
-
 struct txt_heap_end_element {
 	u32 type;
 	u32 size;
 } __packed;
 
-#define TXT_HEAP_EXTDATA_TYPE_TPM_EVENT_LOG_PTR		5
-
 struct txt_heap_event_log_element {
 	u64 event_log_phys_addr;
 } __packed;
-
-#define TXT_HEAP_EXTDATA_TYPE_EVENT_LOG_POINTER2_1	8
 
 struct txt_heap_event_log_pointer2_1_element {
 	u64 phys_addr;
 	u32 allocated_event_container_size;
 	u32 first_record_offset;
 	u32 next_record_offset;
+} __packed;
+
+struct txt_heap_tpr_range {
+	u64 tpr_range_base;
+	u64 tpr_range_size;
+} __packed;
+
+struct txt_heap_tpr_req_element {
+	u32 tpr_cnt;
+	struct txt_heap_tpr_range tpr_req_arr[];
 } __packed;
 
 /*
@@ -316,6 +329,30 @@ txt_find_log2_1_element(struct txt_os_sinit_data *os_sinit_data)
 	while (ext_elem->type != TXT_HEAP_EXTDATA_TYPE_END) {
 		if (ext_elem->type == TXT_HEAP_EXTDATA_TYPE_EVENT_LOG_POINTER2_1) {
 			return (struct txt_heap_event_log_pointer2_1_element *)
+				((u8 *)ext_elem + sizeof(struct txt_heap_ext_data_element));
+		}
+		ext_elem = (struct txt_heap_ext_data_element *)
+			    ((u8 *)ext_elem + ext_elem->size);
+	}
+
+	return NULL;
+}
+
+/*
+ * Find the TPR request element in the TXT heap extended data. This element
+ * contains the DMA protection ranges when TPR is used instead of legacy PMRs.
+ */
+static inline struct txt_heap_tpr_req_element*
+txt_find_tpr_req_element(struct txt_os_sinit_data *os_sinit_data)
+{
+	struct txt_heap_ext_data_element *ext_elem;
+
+	ext_elem = (struct txt_heap_ext_data_element *)
+		((u8 *)os_sinit_data + sizeof(struct txt_os_sinit_data));
+
+	while (ext_elem->type != TXT_HEAP_EXTDATA_TYPE_END) {
+		if (ext_elem->type == TXT_HEAP_EXTDATA_TYPE_TPR_REQ) {
+			return (struct txt_heap_tpr_req_element *)
 				((u8 *)ext_elem + sizeof(struct txt_heap_ext_data_element));
 		}
 		ext_elem = (struct txt_heap_ext_data_element *)

@@ -378,52 +378,53 @@ The backup copy of the ACPI DMAR table in the TXT heap could not be mapped. The
 underlying issue is a failure to early_memremap() the DMAR table, most likely
 due to a resource shortage.
 
-======  ====================
-Name:   SL_ERROR_HI_PMR_BASE
+======  =========================
+Name:   SL_ERROR_HI_DMA_PROT_BASE
 Value:  0xc0008014
-======  ====================
+======  =========================
 
 Description:
 
-On a system with more than 4Gb of RAM, the high PMR [2]_ base address should be
-set to 4Gb. This error is due to that not being the case. This PMR value is set
-by the pre-launch environment, so the issue most likely originates there. It
-could also be the sign of an attempted attack.
-
-======  ====================
-Name:   SL_ERROR_HI_PMR_SIZE
-Value:  0xc0008015
-======  ====================
-
-Description:
-
-On a system with more than 4Gb of RAM, the high PMR [2]_ size should be set to
-cover all RAM > 4Gb. This error is due to that not being the case. This PMR
-value is set by the pre-launch environment, so the issue most likely originates
-there. It could also be the sign of an attempted attack.
-
-======  ====================
-Name:   SL_ERROR_LO_PMR_BASE
-Value:  0xc0008016
-======  ====================
-
-Description:
-
-The low PMR [2]_ base should always be set to address zero. This error is due
-to that not being the case. This PMR value is set by the pre-launch environment
-so the issue most likely originates there. It could also be the sign of an
-attempted attack.
-
-======  ====================
-Name:   SL_ERROR_LO_PMR_MLE
-Value:  0xc0008017
-======  ====================
-
-Description:
-
-This error indicates the MLE image is not covered by the low PMR [2]_ range.
-The PMR values are set by the pre-launch environment, so the issue most likely
+On a system with more than 4Gb of RAM, the high DMA protection [2]_ range base
+address should be set to 4Gb. This error is due to that not being the case.
+This value is set by the pre-launch environment, so the issue most likely
 originates there. It could also be the sign of an attempted attack.
+
+======  =========================
+Name:   SL_ERROR_HI_DMA_PROT_SIZE
+Value:  0xc0008015
+======  =========================
+
+Description:
+
+On a system with more than 4Gb of RAM, the high DMA protection [2]_ range size
+should be set to cover all RAM > 4Gb. This error is due to that not being the
+case. This value is set by the pre-launch environment, so the issue most likely
+originates there. It could also be the sign of an attempted attack.
+
+======  =========================
+Name:   SL_ERROR_LO_DMA_PROT_BASE
+Value:  0xc0008016
+======  =========================
+
+Description:
+
+The low DMA protection [2]_ range base should always be set to address zero.
+This error is due to that not being the case. This value is set by the
+pre-launch environment, so the issue most likely originates there. It could also
+be the sign of an attempted attack.
+
+======  ========================
+Name:   SL_ERROR_LO_DMA_PROT_MLE
+Value:  0xc0008017
+======  ========================
+
+Description:
+
+This error indicates the MLE image is not covered by the low DMA protection
+[2]_ range. The DMA protection values are set by the pre-launch environment, so
+the issue most likely originates there. It could also be the sign of an
+attempted attack.
 
 ======  =======================
 Name:   SL_ERROR_INITRD_TOO_BIG
@@ -472,17 +473,17 @@ with the MLE image in memory. This value is set by the pre-launch environment
 so the issue most likely originates there. It could also be the sign of an
 attempted attack.
 
-======  ==========================
-Name:   SL_ERROR_BUFFER_BEYOND_PMR
+======  ===============================
+Name:   SL_ERROR_BUFFER_BEYOND_DMA_PROT
 Value:  0xc000801c
-======  ==========================
+======  ===============================
 
 Description:
 
 One of the buffers passed to the MLE via the OS-MLE TXT heap table is not
-protected by a PMR. This value is set by the pre-launch environment, so the
-issue most likely originates there. It could also be the sign of an attempted
-attack.
+covered by DMA protection [2]_. This value is set by the pre-launch
+environment, so the issue most likely originates there. It could also be the
+sign of an attempted attack.
 
 ======  =============================
 Name:   SL_ERROR_OS_SINIT_BAD_VERSION
@@ -571,17 +572,57 @@ An error occurred in the Secure Launch module while mapping the Secure Launch
 Resource table. The underlying issue is memremap() failure, most likely due to
 a resource shortage.
 
+======  =====================
+Name:   SL_ERROR_TPR_INVALID
+Value:  0xc0008025
+======  =====================
+
+Description:
+
+The TPR (TXT Protected Range) extended data element in the TXT heap contains
+invalid data, such as a zero range count or inconsistent range values. This
+value is set by the pre-launch environment, so the issue most likely originates
+there. It could also be the sign of an attempted attack.
+
+======  =========================
+Name:   SL_ERROR_TPR_UNSUPPORTED
+Value:  0xc0008026
+======  =========================
+
+Description:
+
+The TPR (TXT Protected Range) extended data element in the TXT heap has an
+unsupported range count. The kernel currently expects 1 or 2 TPR ranges (low
+memory below 4Gb and optionally high memory above 4Gb). This value is set by
+the pre-launch environment which may be using a configuration not yet supported
+by this kernel.
+
+======  ========================
+Name:   SL_ERROR_TPR_NOT_FOUND
+Value:  0xc0008027
+======  ========================
+
+Description:
+
+The SINIT ACM capabilities advertise TPR (TXT Protected Range) support, but the
+TPR extended data element could not be found in the TXT heap. This value is set
+by the pre-launch environment, so the issue most likely originates there. It
+could also be the sign of an attempted attack.
+
 .. [1]
     MLE: Measured Launch Environment is the binary runtime that is measured and
     then run by the TXT SINIT ACM. The TXT MLE Development Guide describes the
     requirements for the MLE in detail.
 
 .. [2]
-    PMR: Intel VTd has a feature in the IOMMU called Protected Memory Registers.
-    There are two of these registers and they allow all DMA to be blocked
-    to large areas of memory. The low PMR can cover all memory below 4Gb on 2Mb
-    boundaries. The high PMR can cover all RAM on the system, again on 2Mb
-    boundaries. This feature is used during a Secure Launch by TXT.
+    DMA protection: Intel TXT uses DMA protection to prevent devices from
+    accessing protected memory during a measured launch. Two mechanisms exist:
+    legacy PMRs (Protected Memory Registers) in the Intel VT-d IOMMU, which
+    provide a low range covering memory below 4Gb and a high range covering
+    memory above 4Gb on 2Mb boundaries; and the newer TPR (TXT Protected Range)
+    mechanism, which provides equivalent protection through extended data
+    elements in the TXT heap. SINIT ACM advertises TPR support via capability
+    bit 14.
 
 .. [3]
     Secure Launch Specification: https://trenchboot.org/specifications/Secure_Launch/

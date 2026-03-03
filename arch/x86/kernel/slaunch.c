@@ -25,7 +25,7 @@
 static u32 sl_flags __ro_after_init;
 static struct sl_ap_wake_info ap_wake_info __ro_after_init;
 static struct slr_entry_log_info sl_log_info __ro_after_init;
-static u64 vtd_pmr_lo_size __ro_after_init;
+static u64 dma_prot_lo_size __ro_after_init;
 
 /* This should be plenty of room */
 static u8 txt_dmar[PAGE_SIZE] __aligned(16);
@@ -164,66 +164,146 @@ static void __init txt_early_put_heap_table(void *addr, unsigned long size)
 }
 
 /*
- * TXT uses a special set of VTd registers to protect all of memory from DMA
- * until the IOMMU can be programmed to protect memory. There is the low
- * memory PMR that can protect all memory up to 4G. The high memory PRM can
- * be setup to protect all memory beyond 4Gb. Validate that these values cover
+ * Find the lowest RAM address at or above 4GB in the e820 map.
+ * Returns 0 if no RAM exists above 4GB.
+ */
+static u64 __init e820_min_hi_ram(void)
+{
+	u64 min_addr = 0;
+	int i;
+
+	for (i = 0; i < e820_table->nr_entries; i++) {
+		struct e820_entry *entry = &e820_table->entries[i];
+
+		if (entry->type != E820_TYPE_RAM)
+			continue;
+		if (entry->addr < 0x100000000ULL)
+			continue;
+		if (!min_addr || entry->addr < min_addr)
+			min_addr = entry->addr;
+	}
+
+	return min_addr;
+}
+
+/*
+ * TXT uses DMA protection to protect all of memory from DMA until the IOMMU
+ * can be programmed. On newer platforms with TPR (TXT Protected Range) support,
+ * the protection ranges are specified via extended data elements in the TXT
+ * heap. On older platforms, legacy PMR (Protected Memory Regions) fields in
+ * the OS-SINIT data are used instead. Validate that the protection covers
  * what is expected.
  */
-static void __init slaunch_verify_pmrs(void __iomem *txt)
+static void __init slaunch_verify_dma_protection(void __iomem *txt)
 {
+	struct txt_heap_tpr_req_element *tpr_req;
 	struct txt_os_sinit_data *os_sinit_data;
+	u64 lo_size, hi_base, hi_size;
 	u32 field_offset, err = 0;
 	const char *errmsg = "";
 	unsigned long last_pfn;
 
-	field_offset = offsetof(struct txt_os_sinit_data, lcp_po_base);
+	/*
+	 * Map enough of the OS-SINIT data to read the full base structure
+	 * including capabilities and extended data elements for TPR.
+	 */
+	field_offset = sizeof(struct txt_os_sinit_data) + 256;
 	os_sinit_data = txt_early_get_heap_table(txt, TXT_OS_SINIT_DATA_TABLE,
 						 field_offset);
 
-	/* Save a copy */
-	vtd_pmr_lo_size = os_sinit_data->vtd_pmr_lo_size;
+	if (os_sinit_data->capabilities & (1 << TXT_SINIT_MLE_CAP_TPR_SUPPORT)) {
+		tpr_req = txt_find_tpr_req_element(os_sinit_data);
+		if (!tpr_req) {
+			err = SL_ERROR_TPR_NOT_FOUND;
+			errmsg = "TPR element not found in TXT heap\n";
+			goto out;
+		}
+		if (tpr_req->tpr_cnt < 1) {
+			err = SL_ERROR_TPR_INVALID;
+			errmsg = "Error invalid TPR element\n";
+			goto out;
+		}
+		if (tpr_req->tpr_cnt > 2) {
+			err = SL_ERROR_TPR_UNSUPPORTED;
+			errmsg = "Unsupported TPR range count\n";
+			goto out;
+		}
+
+		lo_size = tpr_req->tpr_req_arr[0].tpr_range_size;
+		if (tpr_req->tpr_cnt >= 2) {
+			hi_base = tpr_req->tpr_req_arr[1].tpr_range_base;
+			hi_size = tpr_req->tpr_req_arr[1].tpr_range_size;
+		} else {
+			/* <= 4GB RAM: no hi range */
+			hi_base = 0;
+			hi_size = 0;
+		}
+	} else {
+		lo_size = os_sinit_data->vtd_pmr_lo_size;
+		hi_base = os_sinit_data->vtd_pmr_hi_base;
+		hi_size = os_sinit_data->vtd_pmr_hi_size;
+	}
+
+	/* Save lo protection size for use in memory reservation */
+	dma_prot_lo_size = lo_size;
 
 	last_pfn = e820__end_of_ram_pfn();
 
 	/*
-	 * First make sure the hi PMR covers all memory above 4G. In the
-	 * unlikely case where there is < 4G on the system, the hi PMR will
-	 * not be set.
+	 * Check whether the system has any RAM above 4GB by looking at
+	 * the e820 table. If it does, the hi DMA protection range must
+	 * be present and must cover all of it.
 	 */
-	if (os_sinit_data->vtd_pmr_hi_base != 0x0ULL) {
-		if (os_sinit_data->vtd_pmr_hi_base != 0x100000000ULL) {
-			err = SL_ERROR_HI_PMR_BASE;
-			errmsg =  "Error hi PMR base\n";
+	if (PFN_PHYS(last_pfn) > 0x100000000ULL) {
+		if (hi_base == 0) {
+			err = SL_ERROR_HI_DMA_PROT_BASE;
+			errmsg = "Hi DMA protection missing but system has RAM above 4GB\n";
 			goto out;
 		}
 
-		if (PFN_PHYS(last_pfn) > os_sinit_data->vtd_pmr_hi_base +
-		    os_sinit_data->vtd_pmr_hi_size) {
-			err = SL_ERROR_HI_PMR_SIZE;
-			errmsg = "Error hi PMR size\n";
+		if (hi_base < 0x100000000ULL) {
+			err = SL_ERROR_HI_DMA_PROT_BASE;
+			errmsg = "Hi DMA protection base below 4GB\n";
+			goto out;
+		}
+
+		/*
+		 * Verify that the hi range base is at or below the lowest
+		 * RAM address above 4GB, so no high RAM is left unprotected.
+		 * The base does not have to be exactly 4GB — it depends on
+		 * the platform's memory layout.
+		 */
+		if (hi_base > e820_min_hi_ram()) {
+			err = SL_ERROR_HI_DMA_PROT_BASE;
+			errmsg = "Hi DMA protection base above first high RAM region\n";
+			goto out;
+		}
+
+		if (PFN_PHYS(last_pfn) > hi_base + hi_size) {
+			err = SL_ERROR_HI_DMA_PROT_SIZE;
+			errmsg = "Hi DMA protection does not cover all RAM above 4GB\n";
 			goto out;
 		}
 	}
 
 	/*
-	 * Lo PMR base should always be 0. This was already checked in
+	 * Lo range base should always be 0. This was already checked in
 	 * early stub.
 	 */
 
 	/*
 	 * Check that if the kernel was loaded below 4G, that it is protected
-	 * by the lo PMR. Note this is the decompressed kernel. The ACM would
+	 * by the lo range. Note this is the decompressed kernel. The ACM would
 	 * have ensured the compressed kernel (the MLE image) was protected.
 	 */
-	if (__pa_symbol(_end) < 0x100000000ULL && __pa_symbol(_end) > os_sinit_data->vtd_pmr_lo_size) {
-		err = SL_ERROR_LO_PMR_MLE;
-		errmsg = "Error lo PMR does not cover MLE kernel\n";
+	if (__pa_symbol(_end) < 0x100000000ULL && __pa_symbol(_end) > lo_size) {
+		err = SL_ERROR_LO_DMA_PROT_MLE;
+		errmsg = "Error lo DMA protection does not cover MLE kernel\n";
 	}
 
 	/*
 	 * Other regions of interest like boot param, AP wake block, cmdline
-	 * already checked for PMR coverage in the early stub code.
+	 * already checked for DMA protection coverage in the early stub code.
 	 */
 
 out:
@@ -257,8 +337,8 @@ static void __init slaunch_txt_reserve_range(u64 base, u64 size)
  *  - The AP wake block
  *  - TPM log external to the TXT heap
  *
- * Also if the low PMR doesn't cover all memory < 4G, any RAM regions above
- * the low PMR must be reserved too.
+ * Also if the low DMA protection range doesn't cover all memory < 4G, any RAM
+ * regions above the range must be reserved too.
  */
 static void __init slaunch_txt_reserve(void __iomem *txt)
 {
@@ -325,11 +405,11 @@ nomdr:
 	for (i = 0; i < e820_table->nr_entries; i++) {
 		base = e820_table->entries[i].addr;
 		size = e820_table->entries[i].size;
-		if (base >= vtd_pmr_lo_size && base < 0x100000000ULL)
+		if (base >= dma_prot_lo_size && base < 0x100000000ULL)
 			slaunch_txt_reserve_range(base, size);
-		else if (base < vtd_pmr_lo_size && base + size > vtd_pmr_lo_size)
-			slaunch_txt_reserve_range(vtd_pmr_lo_size,
-						  base + size - vtd_pmr_lo_size);
+		else if (base < dma_prot_lo_size && base + size > dma_prot_lo_size)
+			slaunch_txt_reserve_range(dma_prot_lo_size,
+						  base + size - dma_prot_lo_size);
 	}
 }
 
@@ -490,7 +570,7 @@ static void __init slaunch_setup_txt(void)
 
 	slaunch_fetch_values(txt);
 
-	slaunch_verify_pmrs(txt);
+	slaunch_verify_dma_protection(txt);
 
 	slaunch_txt_reserve(txt);
 

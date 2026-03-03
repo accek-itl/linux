@@ -266,18 +266,52 @@ SYM_FUNC_START(sl_txt_verify_os_mle_struct)
 	/* Load MLE image base absolute offset */
 	movl	rva(sl_mle_start)(%ebx), %ebx
 
-	/* Verify the value of the low PMR base. It should always be 0. */
+	/* Verify the value of the low DMA protection base. It should always be 0. */
 	movl	SL_vtd_pmr_lo_base(%edx), %esi
 	cmpl	$0, %esi
-	jz	.Lvalid_pmr_base
-	TXT_RESET $(SL_ERROR_LO_PMR_BASE)
+	jz	.Lvalid_dma_prot_base
+	TXT_RESET $(SL_ERROR_LO_DMA_PROT_BASE)
 
-.Lvalid_pmr_base:
+.Lvalid_dma_prot_base:
 	/* Grab some values from OS-SINIT structure */
 	movl	SL_mle_size(%edx), %edi
 	addl	%ebx, %edi
 	jc	.Loverflow_detected
 	movl	SL_vtd_pmr_lo_size(%edx), %esi
+
+	/*
+	 * If TPR (TXT Protected Range) is supported, the PMR fields may be
+	 * zero. Walk the OS-SINIT extended data elements to find the TPR_REQ
+	 * element and extract the effective lo protection range size.
+	 */
+	testl	$(1 << TXT_SINIT_MLE_CAP_TPR_SUPPORT), SL_capabilities(%edx)
+	jz	.Lno_tpr
+
+	leal	SL_os_sinit_ext_data(%edx), %ecx
+.Ltpr_walk:
+	cmpl	$TXT_HEAP_EXTDATA_TYPE_END, SL_ext_data_type(%ecx)
+	je	.Ltpr_not_found
+	cmpl	$TXT_HEAP_EXTDATA_TYPE_TPR_REQ, SL_ext_data_type(%ecx)
+	je	.Ltpr_found
+	addl	SL_ext_data_size(%ecx), %ecx
+	jmp	.Ltpr_walk
+
+.Ltpr_found:
+	/* Advance past the ext data element header to TPR request data */
+	addl	$SL_ext_data_header_size, %ecx
+
+	cmpl	$1, SL_tpr_cnt(%ecx)
+	jb	.Ltpr_invalid
+	cmpl	$2, SL_tpr_cnt(%ecx)
+	ja	.Ltpr_unsupported
+
+	/* Advance to tpr_req_arr[0] */
+	addl	$SL_tpr_req_arr, %ecx
+
+	/* lo protection size = arr[0].base + arr[0].size (lower 32 bits) */
+	movl	SL_tpr_range_base(%ecx), %esi
+	addl	SL_tpr_range_size(%ecx), %esi
+.Lno_tpr:
 
 	/* Check the AP wake block */
 	movl	SL_ap_wake_block(%eax), %ecx
@@ -289,7 +323,7 @@ SYM_FUNC_START(sl_txt_verify_os_mle_struct)
 	call	sl_check_buffer_mle_overlap
 	popl	%eax
 	cmpl	%esi, %edx
-	ja	.Lbuffer_beyond_pmr
+	ja	.Lbuffer_beyond_dma_prot
 
 	/*
 	 * Check the boot params. Note during a UEFI boot, the boot
@@ -305,7 +339,7 @@ SYM_FUNC_START(sl_txt_verify_os_mle_struct)
 	call	sl_check_buffer_mle_overlap
 	popl	%eax
 	cmpl	%esi, %edx
-	ja	.Lbuffer_beyond_pmr
+	ja	.Lbuffer_beyond_dma_prot
 
 	/* Check that the AP wake block is big enough */
 	cmpl	$(sl_txt_ap_wake_end - sl_txt_ap_wake_begin), \
@@ -320,8 +354,17 @@ SYM_FUNC_START(sl_txt_verify_os_mle_struct)
 .Loverflow_detected:
 	TXT_RESET $(SL_ERROR_INTEGER_OVERFLOW)
 
-.Lbuffer_beyond_pmr:
-	TXT_RESET $(SL_ERROR_BUFFER_BEYOND_PMR)
+.Lbuffer_beyond_dma_prot:
+	TXT_RESET $(SL_ERROR_BUFFER_BEYOND_DMA_PROT)
+
+.Ltpr_not_found:
+	TXT_RESET $(SL_ERROR_TPR_NOT_FOUND)
+
+.Ltpr_invalid:
+	TXT_RESET $(SL_ERROR_TPR_INVALID)
+
+.Ltpr_unsupported:
+	TXT_RESET $(SL_ERROR_TPR_UNSUPPORTED)
 SYM_FUNC_END(sl_txt_verify_os_mle_struct)
 
 SYM_FUNC_START(sl_txt_ap_entry)
