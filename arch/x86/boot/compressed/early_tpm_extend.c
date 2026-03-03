@@ -460,16 +460,18 @@ static enum tpm_family tpm_find_interface_and_family(struct tpm_chip *chip)
 	struct tpm_intf_capability intf_cap;
 	struct tpm_interface_id intf_id;
 
+	/* First determine if the interface is CRB. It it is, then for sure we have 2.0 family. */
+	intf_id.val = tpm_read32(chip, TPM_INTF_ID(0));
+	if (intf_id.interface_type == TPM_CRB_INTF_ACTIVE)
+		return TPM_FAMILY_INVALID; /* We don't support CRB interface yet */
+	if (intf_id.interface_type != TPM_TIS_INTF_ACTIVE)
+		return TPM_FAMILY_INVALID; /* Unsupported interface type */
+
 	/* Sort out whether it is 1.x */
 	intf_cap.val = tpm_read32(chip, TPM_INTF_CAPS(0));
 	if ((intf_cap.interface_version == TPM_TIS_INTF_12) ||
 	    (intf_cap.interface_version == TPM_TIS_INTF_13))
 		return TPM_FAMILY_12; /* Always TIS */
-
-	/* Assume that it is 2.0 but check if the interface is CRB */
-	intf_id.val = tpm_read32(chip, TPM_INTF_ID(0));
-	if (intf_id.interface_type == TPM_CRB_INTF_ACTIVE)
-		return TPM_FAMILY_INVALID;
 
 	/* Else TPM 2.0 with TIS interface */
 	return TPM_FAMILY_20;
